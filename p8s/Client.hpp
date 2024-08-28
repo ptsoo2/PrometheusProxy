@@ -51,7 +51,12 @@ namespace p8s
             thread_.reset();
         }
 
-        // 종료시 마지막으로 한번 더 밀어넣는다.
+        // 게이트웨이에서 마지막 값을 유지하고 있으므로 종료시에는 전부 0으로 갱신한다.
+        for (auto& iter : mapGauge_)
+        {
+            prometheus::Gauge* gauge = iter.second;
+            gauge->Set(0.0);
+        }
         _flush();
 
         gateway_.reset();
