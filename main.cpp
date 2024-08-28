@@ -1,8 +1,10 @@
 #include <array>
 
-#include "PrometheusProxy.h"
+#include "p8s/MetricCollector.h"
+#include "p8s/Client.h"
+#include "p8s/Server.h"
 
-void example()
+void exampleServer()
 {
     // 포트 8080에서 실행되는 HTTP 서버를 만듭니다.
     prometheus::Exposer exposer{ "0.0.0.0:9090" };
@@ -38,7 +40,7 @@ void example()
 
     const std::array<std::string, 4> methods{ "GET", "PUT", "POST", "HEAD" };
 
-    for (;;)
+    while (true)
     {
         const int randomValue = std::rand();
 
@@ -62,6 +64,46 @@ void example()
     }
 }
 
+void exampleClient()
+{
+    using namespace prometheus;
+
+    // 푸시 게이트웨이를 만듭니다.
+    const prometheus::Labels labels = Gateway::GetInstanceLabel("test_hostname");
+
+    prometheus::Gateway gateway{ "172.30.1.89", "9091", "sample_client", labels };
+
+    // 모든 메트릭에 적용된 component=main 레이블이 있는 메트릭 레지스트리를 만듭니다.
+    std::shared_ptr<prometheus::Registry> registry = std::make_shared<prometheus::Registry>();
+
+    // 레지스트리에 새 카운터 패밀리를 추가합니다(패밀리는 동일한 이름을 가진 값과 다른 레이블 치수를 결합합니다).
+    auto& counter_family = BuildCounter()
+        .Name("time_running_seconds_total")
+        .Help("How many seconds is this server running?")
+        .Labels({ {"label", "value"} })
+        .Register(*registry);
+
+    // 메트릭 패밀리에 카운터를 추가합니다.
+    prometheus::Counter& second_counter = counter_family.Add({ {"another_label", "value"}, {"yet_another_label", "value"} });
+
+    // 푸시어에게 메트릭을 푸시하도록 요청합니다.
+    gateway.RegisterCollectable(registry);
+
+    // 사용자 정의 HTTP 헤더를 추가합니다.
+    gateway.AddHttpHeader("Foo:foo");
+
+    while (true)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // 카운터를 1씩 증가시킵니다.
+        second_counter.Increment();
+
+        // 메트릭을 푸시합니다.
+        auto returnCode = gateway.Push();
+        std::cout << "returnCode is " << returnCode << std::endl;
+    }
+}
+
 enum ENUM_NETWORK_METRIC : uint32_t
 {
     METRIC_1 = 0,
@@ -72,45 +114,45 @@ enum ENUM_NETWORK_METRIC : uint32_t
     _METRIC_MAX_,
 };
 
-int main()
+void testServer()
 {
-    auto cbLog = [](std::string&& str)
+    p8s::Server server(
+        [](std::string&& str)
         {
             printf("%s \n", str.c_str());
-        };
+        }
+    );
 
-    PrometheusProxy proxy{ std::move(cbLog) };
-
-    proxy
+    server
         .registerFamily("observed_packets_total", "Number of observed packets")
-        .addCounter(METRIC_1, { {"protocol", "tcp"}, { "direction", "rx" } })
-        .addCounter(METRIC_2, { {"protocol", "tcp"}, { "direction", "tx" } })
-        .addCounter(METRIC_3, { {"protocol", "udp"}, { "direction", "rx" } })
-        .addCounter(METRIC_4, { {"protocol", "udp"}, { "direction", "tx" } })
+        .addGauge(METRIC_1, { {"protocol", "tcp"}, { "direction", "rx" } })
+        .addGauge(METRIC_2, { {"protocol", "tcp"}, { "direction", "tx" } })
+        .addGauge(METRIC_3, { {"protocol", "udp"}, { "direction", "rx" } })
+        .addGauge(METRIC_4, { {"protocol", "udp"}, { "direction", "tx" } })
         ;
 
-    proxy
+    server
         .registerFamily("http_requests_total", "Number of HTTP requests")
-        .addCounter(METRIC_5, { {"method", "GET"} })
+        .addGauge(METRIC_5, { {"method", "GET"} })
         ;
 
-    if (proxy.open("172.30.1.62:9090") == false)
+    if (server.open("172.30.1.62:9090") == false)
     {
         printf("Failed to do open \n");
-        return -1;
+        return;
     }
 
-    proxy.increment(METRIC_1, 1.0);
-    proxy.increment(METRIC_2, 1.0);
-    proxy.increment(METRIC_3, 1.0);
-    proxy.increment(METRIC_4, 1.0);
-    proxy.increment(METRIC_5, 1.0);
+    server.increment(METRIC_1, 1.0);
+    server.increment(METRIC_2, 1.0);
+    server.increment(METRIC_3, 1.0);
+    server.increment(METRIC_4, 1.0);
+    server.increment(METRIC_5, 1.0);
 
-    proxy.reset(METRIC_1);
-    proxy.reset(METRIC_2);
-    proxy.reset(METRIC_3);
-    proxy.reset(METRIC_4);
-    proxy.reset(METRIC_5);
+    server.reset(METRIC_1);
+    server.reset(METRIC_2);
+    server.reset(METRIC_3);
+    server.reset(METRIC_4);
+    server.reset(METRIC_5);
 
     size_t counter = 10;
     while (counter--)
@@ -121,20 +163,20 @@ int main()
         {
         case 0:
         {
-            proxy.increment(randVal2);
+            server.increment(randVal2);
             printf("increment (%d, 1) \n", randVal2);
         }
         break;
         case 1:
         {
             const double value = static_cast<double>(rand() % 2147483);
-            proxy.increment(randVal2, value);
+            server.increment(randVal2, value);
             printf("increment (%d, %f) \n", randVal2, value);
         }
         break;
         case 2:
         {
-            proxy.reset(randVal2);
+            server.reset(randVal2);
             printf("reset (%d) \n", randVal2);
         }
         break;
@@ -143,7 +185,100 @@ int main()
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    proxy.close();
+    server.close();
+}
+
+void testClient()
+{
+    p8s::Client client(
+        [](std::string&& str)
+        {
+            printf("%s \n", str.c_str());
+        }
+    );
+
+    client
+        .registerFamily("observed_packets_total22", "Number of observed packets")
+        .addGauge(METRIC_1, { {"protocol", "tcp"}, { "direction", "rx" } })
+        .addGauge(METRIC_2, { {"protocol", "tcp"}, { "direction", "tx" } })
+        .addGauge(METRIC_3, { {"protocol", "udp"}, { "direction", "rx" } })
+        .addGauge(METRIC_4, { {"protocol", "udp"}, { "direction", "tx" } })
+        ;
+
+    client
+        .registerFamily("http_requests_total22", "Number of HTTP requests")
+        .addGauge(METRIC_5, { {"method", "GET"} })
+        ;
+
+    p8s::ClientOption option
+    {
+        .ipAddress_ = "172.30.1.89",
+        .port_ = 9091,
+        .jobName_ = "sample_client",
+        .mapLabel_ = { {"instance", "sample_client"} },
+        .userName_ = "admin",
+        .password_ = "admin",
+        .timeout_ = std::chrono::seconds(0),
+    };
+
+    if (client.open(std::move(option)) == false)
+    {
+        printf("Failed to do open \n");
+        return;
+    }
+
+    client.increment(METRIC_1, 1.0);
+    client.increment(METRIC_2, 1.0);
+    client.increment(METRIC_3, 1.0);
+    client.increment(METRIC_4, 1.0);
+    client.increment(METRIC_5, 1.0);
+
+    client.reset(METRIC_1);
+    client.reset(METRIC_2);
+    client.reset(METRIC_3);
+    client.reset(METRIC_4);
+    client.reset(METRIC_5);
+
+    size_t counter = 10;
+    while (counter--)
+    {
+        auto randVal = rand() % 3;
+        auto randVal2 = (ENUM_NETWORK_METRIC)(rand() % _METRIC_MAX_);
+        switch (randVal)
+        {
+        case 0:
+        {
+            client.increment(randVal2);
+            printf("increment (%d, 1) \n", randVal2);
+        }
+        break;
+        case 1:
+        {
+            const double value = static_cast<double>(rand() % 2147483);
+            client.increment(randVal2, value);
+            printf("increment (%d, %f) \n", randVal2, value);
+        }
+        break;
+        case 2:
+        {
+            client.reset(randVal2);
+            printf("reset (%d) \n", randVal2);
+        }
+        break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    client.close();
+}
+
+int main()
+{
+    // exampleServer();
+    // exampleClient();
+    // testClient();
+    testServer();
 
     return 0;
 }
